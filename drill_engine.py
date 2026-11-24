@@ -9,6 +9,9 @@
   处理一次有效信号后轮次 +1，同批其它旧轮次信号全部失效；
 * 换线会把当前载荷重置为“起始载荷”，轮次 +1，并立即重发全部未确认字节；
 * 任何线路（包括旧线）报文的成功回执都有效；
+* 每次重置演练都会分配新的“代次令牌”（generation），旧页面迟到的写请求
+  （含旧回执）携带旧令牌会被 Web 层退回，不可能误确认新演练的同号包；
+  同一场演练内的换线不换令牌，旧线回执照常确认对应字节；
 * 已确认字节用合并区间的并集维护，重叠范围只计一次；
 * 重发打包时跳过所有已确认区间，只取尚未确认的连续字节。
 """
@@ -219,14 +222,23 @@ class Packet:
 
 
 class Drill:
-    """一次演练的全部可变状态。Web 层用锁保护对同一实例的调用。"""
+    """一次演练的全部可变状态。Web 层用锁保护对同一实例的调用。
 
-    def __init__(self, config: Optional[DrillConfig] = None):
-        self.reset(config or DrillConfig.from_raw(None))
+    generation 是这次演练的“代次令牌”：重置会换新令牌，旧页面/在途请求
+    携带旧令牌的写操作会被 Web 层拒绝，从而让重置之后才处理的旧回执等
+    请求不可能误确认新演练里同编号的包。
+    """
+
+    def __init__(self, config: Optional[DrillConfig] = None,
+                 generation: Optional[str] = None):
+        self.reset(config or DrillConfig.from_raw(None), generation)
 
     # ---- 初始化 / 事件 -------------------------------------------------
-    def reset(self, config: DrillConfig) -> None:
+    def reset(self, config: DrillConfig,
+              generation: Optional[str] = None) -> None:
         self.cfg = config
+        # 不传则给一个默认代次；Web 层每次重置都会显式传入新令牌。
+        self.generation = generation if generation is not None else "g1"
         self.active_line = "A"
         self.cur_payload = config.start_payload
         self.round = 1
@@ -512,6 +524,7 @@ class Drill:
     # ---- 序列化 -------------------------------------------------------
     def state_dict(self) -> dict:
         return {
+            "generation": self.generation,
             "config": self.cfg.to_dict(),
             "active_line": self.active_line,
             "cur_payload": self.cur_payload,

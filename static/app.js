@@ -2,6 +2,7 @@
 "use strict";
 
 let STATE = null;
+let GEN = null;            // 当前页面认定的演练代次令牌（来自 /api/state 的 generation）
 let refreshSeq = 0;
 let batchRunning = false;
 
@@ -30,13 +31,29 @@ async function api(path, body) {
   return data;
 }
 
-/* 所有写操作统一走 act：报错弹 toast，成功用响应里的 state 渲染。 */
+/* 所有写操作统一走 act：报错弹 toast，成功用响应里的 state 渲染。
+ * 除 reset 外，请求自动携带当前演练的代次令牌；令牌过期（演练已被另一个
+ * 标签页重置）时服务端返回 409，本页面随后通过 loadState 切到新演练。 */
 async function act(path, body, okMsg) {
+  const callGen = GEN;
+  const payload = body || {};
+  if (!path.endsWith("/api/reset") && callGen !== null) {
+    payload.generation = callGen;
+  }
   try {
-    const data = await api(path, body);
+    const data = await api(path, payload);
     if (data.state) {
       /* 使写操作之前发出、可能晚到的轮询响应失效，避免旧 state 覆盖新界面 */
       refreshSeq += 1;
+      if (data.state.generation !== callGen && callGen !== null
+          && !path.endsWith("/api/reset")) {
+        /* 自己的写请求在飞行途中演练被重置：响应属于新演练，只作兜底刷新，
+         * 不把它当作本次操作的成功结果（画面以轮询到的新演练为准）。 */
+        showToast("演练期间已被重置，本操作按旧演练发出，已失效", true);
+        await loadState();
+        return null;
+      }
+      GEN = data.state.generation;
       render(data.state);
     } else {
       loadState();
@@ -45,8 +62,9 @@ async function act(path, body, okMsg) {
     return data;
   } catch (err) {
     showToast(err.message, true);
-    /* 出错后仍刷新一次，保证界面与服务端一致 */
-    loadState();
+    /* 出错后仍刷新一次，保证界面与服务端一致（409 过期时会拉到新演练）；
+     * 必须等待刷新完成再返回，批量循环才能立刻看到新代次并中止 */
+    await loadState();
     return null;
   }
 }
@@ -57,6 +75,7 @@ async function loadState() {
     const resp = await fetch("/api/state");
     const data = await resp.json();
     if (seq !== refreshSeq || !data.ok) return;
+    GEN = data.state.generation;
     render(data.state);
   } catch (_e) { /* 轮询失败静默 */ }
 }
@@ -120,6 +139,7 @@ function pct(part, all) { return all > 0 ? (part / all * 100) : 0; }
 
 function render(s) {
   STATE = s;
+  GEN = s.generation;   // 画面渲染的是哪一场演练，令牌就指向哪一场
   renderChips(s);
   renderProgress(s);
   renderPackets(s);
@@ -134,6 +154,7 @@ function render(s) {
 function renderChips(s) {
   const lc = s.config.lines[s.active_line];
   $("statusChips").innerHTML = `
+    <span class="chip gen-chip">演练代次：<b>${escapeHtml(String(s.generation))}</b></span>
     <span class="chip line-${s.active_line}">当前线路：<b>${lc.label}</b>
       （MTU ${lc.mtu} / 开销 ${lc.overhead} / 最大载荷 ${lc.max_payload} /
       通知 ${lc.notify ? "开" : "关"}）</span>
@@ -282,18 +303,31 @@ async function batchAck(mode) {
     }
     batchRunning = true;
     setBatchDisabled(true);
+    const batchGen = GEN;
     $("ackHelper").textContent = `按${order === "random" ? "随机乱序" : order === "asc" ? "正序" : "逆序"}依次回执 ${list.length} 个包…`;
+    let abortedByReset = false;
     for (const p of list) {
-      /* 用最新状态再确认一次该包仍可回执 */
+      /* 批量过程中演练被另一标签页重置：立即停止，不再碰新演练的同号包 */
+      if (GEN !== batchGen) { abortedByReset = true; break; }
+      /* 用最新状态再确认一次该包仍可回执（同场演练内也可能已被回执/超时） */
       const fresh = STATE && STATE.packets.find((x) => x.id === p.id);
       if (!fresh || fresh.physical !== "in_flight" || fresh.status !== "outstanding") continue;
       // eslint-disable-next-line no-await-in-loop
       const r = await ackOne(p.id);
-      if (!r) break;
+      if (!r) {
+        /* 409 过期等错误后 loadState 已把 GEN 指向新演练；确认是重置则中止 */
+        if (GEN !== batchGen) abortedByReset = true;
+        break;
+      }
       // eslint-disable-next-line no-await-in-loop
       await new Promise((res) => setTimeout(res, 160));
     }
-    $("ackHelper").textContent = "本轮批量回执完成。";
+    if (abortedByReset) {
+      $("ackHelper").textContent = "演练已重置，批量回执已停止，未确认新演练的任何报文。";
+      showToast("演练已重置，批量回执中止", true);
+    } else {
+      $("ackHelper").textContent = "本轮批量回执完成。";
+    }
     setBatchDisabled(false);
     batchRunning = false;
   }
@@ -356,3 +390,20 @@ bind();
 refreshEffLabels();
 loadState();
 setInterval(loadState, 2500);
+
+/* 调试/自动化测试钩子：只读暴露内部状态，不承载任何业务逻辑。
+ * markAllInFlight / rerender 仅供测试构造“全部在途”的批量回执场景。 */
+window.__DRILL_DEBUG__ = {
+  getState: () => STATE,
+  getGen: () => GEN,
+  isBatchRunning: () => batchRunning,
+  loadState,
+  eligiblePackets: () => (STATE ? eligiblePackets(STATE) : []),
+  markAllInFlight: () => {
+    if (!STATE) return;
+    STATE.packets.forEach((p) => {
+      if (p.status !== "acked") { p.physical = "in_flight"; p.status = "outstanding"; }
+    });
+  },
+  rerender: () => { if (STATE) render(STATE); },
+};

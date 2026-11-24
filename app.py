@@ -17,10 +17,36 @@ app = Flask(__name__)
 _LOCK = threading.RLock()
 _DRILL = Drill()
 
+# 单调递增的演练代次计数器：每次重置分配一个新令牌，旧标签页手里的旧令牌
+# 只能匹配上一场演练，重置之后才被处理的迟到写请求（如旧回执）一律退回。
+_GENERATION_SEQ = 0
+
+
+def _new_generation() -> str:
+    global _GENERATION_SEQ
+    _GENERATION_SEQ += 1
+    return f"gen-{_GENERATION_SEQ}"
+
 
 def _json_body() -> dict:
     data = request.get_json(silent=True)
     return data if isinstance(data, dict) else {}
+
+
+def _check_generation(data: dict) -> None:
+    """拒绝属于上一场演练的迟到写请求。
+
+    缺少 generation 字段的请求视为兼容旧客户端，放行；携带的令牌与当前
+    演练不一致时返回 409（请求与当前状态冲突），且不改变任何状态。
+    """
+    token = data.get("generation")
+    if token is None:
+        return
+    if token != _DRILL.generation:
+        raise DrillError(
+            "演练已被重置，请求来自旧演练（代次令牌已过期），请刷新页面后重试",
+            409,
+        )
 
 
 @app.errorhandler(DrillError)
@@ -57,13 +83,16 @@ def reset_drill():
     data = _json_body()
     with _LOCK:
         cfg = DrillConfig.from_raw(data if data else None)
-        _DRILL = Drill(cfg)
+        # 重置可以在任何回执返回前完成：reset 不做代次校验，直接换令牌。
+        _DRILL = Drill(cfg, generation=_new_generation())
         return jsonify({"ok": True, "state": _DRILL.state_dict()})
 
 
 @app.post("/api/send-next")
 def send_next():
+    data = _json_body()
     with _LOCK:
+        _check_generation(data)
         pkt = _DRILL.send_next()
         return jsonify({"ok": True, "packet": pkt.to_dict(),
                         "state": _DRILL.state_dict()})
@@ -74,6 +103,7 @@ def send_burst():
     data = _json_body()
     count = data.get("count")
     with _LOCK:
+        _check_generation(data)
         pkts = _DRILL.send_burst(None if count in (None, "", 0, "all") else count)
         return jsonify({"ok": True, "packets": [p.to_dict() for p in pkts],
                         "state": _DRILL.state_dict()})
@@ -81,7 +111,9 @@ def send_burst():
 
 @app.post("/api/resend-missing")
 def resend_missing():
+    data = _json_body()
     with _LOCK:
+        _check_generation(data)
         pkts = _DRILL.resend_missing(kind="missing")
         return jsonify({"ok": True, "packets": [p.to_dict() for p in pkts],
                         "state": _DRILL.state_dict()})
@@ -89,8 +121,10 @@ def resend_missing():
 
 @app.post("/api/switch")
 def switch_line():
-    line = _json_body().get("line", "")
+    data = _json_body()
+    line = data.get("line", "")
     with _LOCK:
+        _check_generation(data)
         result = _DRILL.switch_line(str(line).upper())
         return jsonify({"ok": True, "result": result,
                         "state": _DRILL.state_dict()})
@@ -98,7 +132,11 @@ def switch_line():
 
 @app.post("/api/packets/<int:pid>/ack")
 def ack_packet(pid: int):
+    data = _json_body()
     with _LOCK:
+        # 必须先查代次再按 id 找包：旧演练的 #1 与新演练的 #1 编号相同，
+        # 代次不对直接退回，绝不触碰新演练的同号包。
+        _check_generation(data)
         _pkt, added = _DRILL.acknowledge(pid)
         return jsonify({"ok": True, "added_bytes": added,
                         "state": _DRILL.state_dict()})
@@ -106,7 +144,9 @@ def ack_packet(pid: int):
 
 @app.post("/api/packets/<int:pid>/timeout")
 def timeout_packet(pid: int):
+    data = _json_body()
     with _LOCK:
+        _check_generation(data)
         result = _DRILL.trigger_timeout(pid)
         return jsonify({"ok": True, "result": result,
                         "state": _DRILL.state_dict()})
@@ -114,7 +154,9 @@ def timeout_packet(pid: int):
 
 @app.post("/api/packets/<int:pid>/deliver-notice")
 def deliver_notice(pid: int):
+    data = _json_body()
     with _LOCK:
+        _check_generation(data)
         result = _DRILL.deliver_notice(pid)
         return jsonify({"ok": True, "result": result,
                         "state": _DRILL.state_dict()})

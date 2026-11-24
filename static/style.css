@@ -105,6 +105,7 @@ code { font-family: var(--mono); background: #eef2f7; padding: 1px 5px; border-r
 .chip b { font-family: var(--mono); }
 .chip.line-A { background: var(--a-bg); border-color: #c4b5fd; color: #5b21b6; }
 .chip.line-B { background: var(--b-bg); border-color: #67e8f9; color: #155e75; }
+.chip.gen-chip { background: #fef3c7; border-color: #f59e0b; color: #92400e; font-weight: 600; }
 
 .switch-row { padding-top: 8px; border-top: 1px dashed var(--line); }
 .switch-label { color: var(--muted); font-size: 13px; }
