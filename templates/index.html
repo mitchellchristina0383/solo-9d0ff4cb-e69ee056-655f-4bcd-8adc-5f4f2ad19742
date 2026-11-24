@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VPN 换线 · MTU 黑洞演练台</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <h1>VPN 换线 · 大包卡住演练台</h1>
+    <p class="subtitle">
+      报文置 DF 禁止分片：<code>载荷 + 封装开销 &gt; 线路 MTU</code> 即丢弃。
+      可连续发包、乱序回执、触发超时、投递超长通知，或在回执前换线立即重发。
+    </p>
+  </div>
+  <div id="completeBanner" class="complete-banner hidden">✅ 全部字节已确认，传完！</div>
+</header>
+
+<main class="layout">
+  <!-- 左列：参数 + 控制台 -->
+  <section class="col-left">
+    <div class="card">
+      <h2>① 演练参数</h2>
+      <div class="form-grid">
+        <label class="field">
+          <span>报表字节数</span>
+          <input id="cfg-total" type="number" min="1" max="1000000" value="10000">
+        </label>
+        <label class="field">
+          <span>起始载荷（字节）</span>
+          <input id="cfg-start" type="number" min="1" max="65535" value="1400">
+        </label>
+        <label class="field">
+          <span>超时缩包步长</span>
+          <input id="cfg-step" type="number" min="1" max="65535" value="200">
+        </label>
+      </div>
+
+      <div class="lines-grid">
+        <div class="line-cfg line-a">
+          <h3>线路 A <small id="eff-A"></small></h3>
+          <label class="field"><span>MTU</span>
+            <input id="cfg-A-mtu" type="number" value="1500" min="1" max="65535"></label>
+          <label class="field"><span>封装开销</span>
+            <input id="cfg-A-overhead" type="number" value="120" min="0" max="65535"></label>
+          <label class="check"><input id="cfg-A-notify" type="checkbox">
+            <span>返回超长通知（ICMP too-big）</span></label>
+        </div>
+        <div class="line-cfg line-b">
+          <h3>线路 B <small id="eff-B"></small></h3>
+          <label class="field"><span>MTU</span>
+            <input id="cfg-B-mtu" type="number" value="1500" min="1" max="65535"></label>
+          <label class="field"><span>封装开销</span>
+            <input id="cfg-B-overhead" type="number" value="60" min="0" max="65535"></label>
+          <label class="check"><input id="cfg-B-notify" type="checkbox" checked>
+            <span>返回超长通知（ICMP too-big）</span></label>
+        </div>
+      </div>
+
+      <div class="row wrap">
+        <button class="btn primary" id="btnReset">应用参数并重置演练</button>
+        <button class="btn ghost" data-preset="blackhole">预设：A 静默黑洞</button>
+        <button class="btn ghost" data-preset="icmp">预设：A 有超长通知</button>
+      </div>
+      <p class="hint">修改参数后需点击“应用参数并重置演练”生效。</p>
+    </div>
+
+    <div class="card">
+      <h2>② 发包 / 换线控制台</h2>
+      <div id="statusChips" class="chips"></div>
+
+      <div class="row wrap">
+        <button class="btn" id="btnSendOne">发下一包</button>
+        <label class="inline">连发包数
+          <input id="burstCount" type="number" min="1" max="5000" value="8" class="mini">
+        </label>
+        <button class="btn" id="btnBurst">连续发包</button>
+        <button class="btn" id="btnBurstAll">连续发完剩余新包</button>
+        <button class="btn warn" id="btnResendMissing">重发全部未确认</button>
+      </div>
+
+      <div class="row wrap switch-row">
+        <span class="switch-label">回执到达前换线：</span>
+        <button class="btn line-a-bg" id="btnSwitchA">换到线路 A 并立即重发</button>
+        <button class="btn line-b-bg" id="btnSwitchB">换到线路 B 并立即重发</button>
+      </div>
+      <p class="hint">换线会把载荷重置为“起始载荷”、轮次 +1，并按新载荷重发所有尚未确认的字节；
+        旧线上的在途报文仍可回执。</p>
+
+      <div class="progress-block">
+        <div class="progress-head">
+          <strong>累计确认：<span id="ackedBytes">0</span> / <span id="totalBytes">0</span> 字节</strong>
+          <span id="ackedPct">0%</span>
+        </div>
+        <div class="progress"><div id="progressBar" class="progress-bar"></div></div>
+        <div id="rangeChips" class="range-chips"></div>
+        <div id="coverageMap" class="coverage-map" title="确认区间覆盖图"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>③ 回包顺序（也可直接点每包上的按钮）</h2>
+      <div class="row wrap">
+        <label class="inline">批量回执顺序
+          <select id="ackOrder">
+            <option value="asc">按编号正序</option>
+            <option value="desc">按编号逆序</option>
+            <option value="random" selected>随机乱序</option>
+          </select>
+        </label>
+        <button class="btn ok" id="btnAckAll">依次回执所有在途可收包</button>
+        <button class="btn ok ghost" id="btnAckRandom">只随机回执一个</button>
+        <span class="hint" id="ackHelper"></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 右列：报文列表 + 时间线 -->
+  <section class="col-right">
+    <div class="card packets-card">
+      <h2>④ 报文列表（线路 / 长度 / 字节范围 / 操作）</h2>
+      <div class="table-wrap">
+        <table class="packets-table">
+          <thead>
+          <tr>
+            <th>#</th><th>轮次</th><th>线路</th><th>类型</th>
+            <th>载荷长度</th><th>封装后</th><th>字节范围 [起,止)</th>
+            <th>状态（发送端 / 上帝视角）</th><th>操作</th>
+          </tr>
+          </thead>
+          <tbody id="packetRows">
+          <tr><td colspan="9" class="empty">还没有报文，先在上方发包。</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>⑤ 事件时间线</h2>
+      <div id="timeline" class="timeline"></div>
+    </div>
+  </section>
+</main>
+
+<footer class="footer">
+  <details>
+    <summary>规则与实现说明</summary>
+    <ul>
+      <li>字节从 0 开始编号，区间一律左闭右开，如 <code>[0, 1400)</code> 表示第 1～1400 字节。</li>
+      <li>“上帝视角”标出了线路上真实发生的丢弃；静默丢弃的包在发送端仍显示在途，只能由你点“触发超时”。</li>
+      <li>每包带轮次号。投递超长通知或触发超时时，只有属于当前轮次的包能缩包；处理一次后轮次 +1，旧包的信号只记录、不缩包。</li>
+      <li>已确认字节用合并区间并集维护，重叠回执新增 0 字节，不重复计数。</li>
+      <li>重发 / 换线重发打包时跳过已确认区间，只携带尚未确认的连续字节，因此可能比设定载荷短或被已确认区间截断。</li>
+    </ul>
+  </details>
+</footer>
+
+<div id="toast" class="toast hidden"></div>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
